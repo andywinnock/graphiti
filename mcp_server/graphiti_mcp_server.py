@@ -5,6 +5,7 @@ Graphiti MCP Server - Exposes Graphiti functionality through the Model Context P
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -688,10 +689,34 @@ async def process_episode_queue(group_id: str):
         logger.info(f'Stopped episode queue worker for group_id: {group_id}')
 
 
+def normalize_episode_body(episode_body: Any) -> str:
+    """
+    Normalize episode_body to a string, handling automatic JSON serialization.
+    
+    This helper function automatically converts dictionaries and other JSON-serializable
+    objects to properly formatted JSON strings, making it easier for AI assistants to
+    work with structured data without manual JSON escaping.
+    
+    Args:
+        episode_body: The episode content, can be a string, dict, list, or other JSON-serializable type
+        
+    Returns:
+        str: A properly formatted string representation of the episode body
+    """
+    if isinstance(episode_body, str):
+        return episode_body
+    elif isinstance(episode_body, (dict, list)):
+        # Convert dict/list to JSON string automatically
+        return json.dumps(episode_body, ensure_ascii=False, separators=(',', ':'))
+    else:
+        # Convert other types to string
+        return str(episode_body)
+
+
 @mcp.tool()
 async def add_memory(
     name: str,
-    episode_body: str,
+    episode_body: Any,
     group_id: str | None = None,
     source: str = 'text',
     source_description: str = '',
@@ -704,9 +729,11 @@ async def add_memory(
 
     Args:
         name (str): Name of the episode
-        episode_body (str): The content of the episode to persist to memory. When source='json', this must be a
-                           properly escaped JSON string, not a raw Python dictionary. The JSON data will be
-                           automatically processed to extract entities and relationships.
+        episode_body (Any): The content of the episode to persist to memory. Can be:
+                          - A string for text or pre-formatted JSON
+                          - A dictionary or list which will be automatically converted to JSON
+                          - Any other type which will be converted to string
+                          When source='json', dictionaries and lists are automatically serialized.
         group_id (str, optional): A unique ID for this graph. If not provided, uses the default group_id from CLI
                                  or a generated one.
         source (str, optional): Source type, must be one of:
@@ -726,11 +753,18 @@ async def add_memory(
             group_id="some_arbitrary_string"
         )
 
-        # Adding structured JSON data
-        # NOTE: episode_body must be a properly escaped JSON string. Note the triple backslashes
+        # Adding structured JSON data (automatically serialized and source auto-detected)
         add_memory(
             name="Customer Profile",
-            episode_body="{\\\"company\\\": {\\\"name\\\": \\\"Acme Technologies\\\"}, \\\"products\\\": [{\\\"id\\\": \\\"P001\\\", \\\"name\\\": \\\"CloudSync\\\"}, {\\\"id\\\": \\\"P002\\\", \\\"name\\\": \\\"DataMiner\\\"}]}",
+            episode_body={"company": {"name": "Acme Technologies"}, "products": [{"id": "P001", "name": "CloudSync"}, {"id": "P002", "name": "DataMiner"}]},
+            # source="json" is automatically detected when episode_body is dict/list
+            source_description="CRM data"
+        )
+        
+        # Adding structured JSON data (manually formatted string also supported)
+        add_memory(
+            name="Customer Profile",
+            episode_body="{\"company\": {\"name\": \"Acme Technologies\"}, \"products\": [{\"id\": \"P001\", \"name\": \"CloudSync\"}, {\"id\": \"P002\", \"name\": \"DataMiner\"}]}",
             source="json",
             source_description="CRM data"
         )
@@ -746,11 +780,17 @@ async def add_memory(
 
     Notes:
         When using source='json':
-        - The JSON must be a properly escaped string, not a raw Python dictionary
+        - episode_body can be a Python dictionary/list (automatically serialized) OR a JSON string
         - The JSON will be automatically processed to extract entities and relationships
         - Complex nested structures are supported (arrays, nested objects, mixed data types), but keep nesting to a minimum
         - Entities will be created from appropriate JSON properties
         - Relationships between entities will be established based on the JSON structure
+        
+        Automatic type handling:
+        - Dictionaries and lists are converted to JSON strings
+        - When episode_body is dict/list and source='text' (default), source is auto-detected as 'json'
+        - Strings are used as-is
+        - Other types are converted to strings
     """
     global graphiti_client, episode_queues, queue_workers
 
@@ -758,11 +798,21 @@ async def add_memory(
         return ErrorResponse(error='Graphiti client not initialized')
 
     try:
+        # Normalize episode_body to handle automatic JSON serialization
+        episode_body_str = normalize_episode_body(episode_body)
+        
+        # Smart source detection: if episode_body is dict/list and source is default 'text', 
+        # automatically set source to 'json'
+        effective_source = source
+        if source == 'text' and isinstance(episode_body, (dict, list)):
+            effective_source = 'json'
+            logger.info(f"Auto-detected JSON source for episode '{name}' based on episode_body type")
+        
         # Map string source to EpisodeType enum
         source_type = EpisodeType.text
-        if source.lower() == 'message':
+        if effective_source.lower() == 'message':
             source_type = EpisodeType.message
-        elif source.lower() == 'json':
+        elif effective_source.lower() == 'json':
             source_type = EpisodeType.json
 
         # Use the provided group_id or fall back to the default from config
@@ -788,7 +838,7 @@ async def add_memory(
 
                 await client.add_episode(
                     name=name,
-                    episode_body=episode_body,
+                    episode_body=episode_body_str,
                     source=source_type,
                     source_description=source_description,
                     group_id=group_id_str,  # Using the string version of group_id
